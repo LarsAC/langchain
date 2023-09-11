@@ -1,7 +1,16 @@
 """Module contains common parsers for PDFs."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Sequence, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+)
 from urllib.parse import urlparse
 
 from langchain.document_loaders.base import BaseBlobParser
@@ -261,7 +270,7 @@ class AmazonTextractPDFParser(BaseBlobParser):
         )
 
 
-class DocumentIntelligenceParser(BaseBlobParser):
+class DocumentIntelligencePageParser(BaseBlobParser):
     """Loads a PDF with Azure Document Intelligence
     (formerly Forms Recognizer) and chunks at character level."""
 
@@ -281,6 +290,183 @@ class DocumentIntelligenceParser(BaseBlobParser):
                 },
             )
             yield d
+
+    def lazy_parse(self, blob: Blob) -> Iterator[Document]:
+        """Lazily parse the blob."""
+
+        with blob.as_bytes_io() as file_obj:
+            poller = self.client.begin_analyze_document(self.model, file_obj)
+            result = poller.result()
+
+            docs = self._generate_docs(blob, result)
+
+            yield from docs
+
+
+class DocumentNode:
+    """A helper class to aggregate parse results into documents"""
+
+    def __init__(
+        self, type: str, role: str, start: int, end: int, content: str, page: int
+    ) -> None:
+        self.type = type
+        self.role = role
+        self.start = start
+        self.end = end
+        self.page = page
+
+        self.content = content
+
+
+class DocumentNodeList:
+    """A helper class to aggregate parse results into non-overlapping chunks"""
+
+    def __init__(self) -> None:
+        self.docs: List[DocumentNode] = []
+
+    def _does_overlap(self, new_doc: DocumentNode) -> bool:
+        for doc in self.docs:
+            if doc.start < new_doc.end and new_doc.start < doc.end:
+                return True
+        return False
+
+    def add_doc_node(self, doc_node: DocumentNode) -> None:
+        if not self._does_overlap(doc_node):
+            self.docs.append(doc_node)
+            self.docs.sort(key=lambda dn: dn.start)
+
+
+class DocumentIntelligenceDetailParser(BaseBlobParser):
+    """Loads a PDF with Azure Document Intelligence (formerly Forms Recognizer)
+    and chunks at character level."""
+
+    def __init__(self, client: Any, model: str, title: str = "") -> None:
+        self.client = client
+        self.model = model
+        self.title = title
+
+    def _combine_result(
+        self,
+        result: Any,
+    ) -> Sequence[DocumentNode]:
+        """Generate an order list of non-overlapping document nodes
+        with content and some metadata"""
+
+        doc_node_list = DocumentNodeList()
+
+        # Tables first as they overlap with the other types
+        # (text an kvp can appear in tables)
+        for tbl in result.tables:
+            start = tbl.spans[0].offset
+            last_span = tbl.spans[-1]
+            end = last_span.offset + last_span.length
+            page = tbl.bounding_regions[0].page_number
+
+            # generate table content
+            content = ""
+
+            dn = DocumentNode(
+                "TABLE", "", start, end, content, page
+            )  ### Table has no content attribute!
+            doc_node_list.add_doc_node(dn)
+
+        for kvp in result.key_value_pairs:
+            if kvp.key and kvp.value:
+                # Assume KVP is a continuous set of characters in the document (?)
+
+                start = kvp.key.spans[0].offset
+                end = kvp.value.spans[-1].offset + kvp.value.spans[-1].length
+                page = kvp.key.bounding_regions[0].page_number
+
+                dn = DocumentNode(
+                    "KVP",
+                    "",
+                    start,
+                    end,
+                    kvp.key.content + " = " + kvp.value.content,
+                    page,
+                )
+                doc_node_list.add_doc_node(dn)
+
+        for p in result.paragraphs:
+            start = p.spans[0].offset
+            last_span = p.spans[-1]
+            end = last_span.offset + last_span.length
+            role = "paragraph" if (p.role is None) or (p.role == "") else p.role
+            page = p.bounding_regions[0].page_number
+
+            dn = DocumentNode("TEXT", role, start, end, p.content, page)
+            doc_node_list.add_doc_node(dn)
+
+        return doc_node_list.docs
+
+    def _generate_docs(self, blob: Blob, result: Any) -> Sequence[Document]:
+        """Combine nodes that appear under same section heading
+        (just linear, no subsubheadings or whatsoever)"""
+        current_heading = ""
+        current_section_startpage = 1
+        current_section_content = ""
+        current_title = self.title
+
+        doc_nodes = self._combine_result(result)
+
+        docs = []
+
+        for dn in doc_nodes:
+            if dn.type == "TEXT" and dn.role == "paragraph":
+                current_section_content += " " + dn.content + "\n"
+            elif dn.type == "TEXT" and dn.role == "sectionHeading":
+                if len(current_section_content) > 0:
+                    d = Document(
+                        page_content=current_section_content,
+                        metadata={
+                            "source": blob.source,
+                            "page": current_section_startpage,
+                            "section": current_heading,
+                            "title": current_title,
+                            "role": "paragraph",
+                        },
+                    )
+                    docs.append(d)
+
+                # Reset for new section
+                current_heading = dn.content
+                current_section_startpage = dn.page
+                current_section_content = ""
+            elif (
+                (dn.type == "TEXT")
+                and (dn.role == "title")
+                and (len(current_title) == 0)
+            ):
+                current_title = dn.content
+            elif dn.type == "KVP":
+                d = Document(
+                    page_content=dn.content,
+                    metadata={
+                        "source": blob.source,
+                        "page": current_section_startpage,
+                        "section": current_heading,
+                        "title": current_title,
+                        "role": "kvp",
+                    },
+                )
+                docs.append(d)
+
+        # add final paragraph
+        if len(current_section_content) > 0:
+            d = Document(
+                page_content=current_section_content,
+                metadata={
+                    "source": blob.source,
+                    "page": current_section_startpage,
+                    "section": current_heading,
+                    "title": current_title,
+                    "role": "paragraph",
+                },
+            )
+            docs.append(d)
+
+        return docs
 
     def lazy_parse(self, blob: Blob) -> Iterator[Document]:
         """Lazily parse the blob."""

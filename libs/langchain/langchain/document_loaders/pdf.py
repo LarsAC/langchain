@@ -12,11 +12,12 @@ from urllib.parse import urlparse
 import requests
 
 from langchain.docstore.document import Document
-from langchain.document_loaders.base import BaseLoader
+from langchain.document_loaders.base import BaseBlobParser, BaseLoader
 from langchain.document_loaders.blob_loaders import Blob
 from langchain.document_loaders.parsers.pdf import (
     AmazonTextractPDFParser,
-    DocumentIntelligenceParser,
+    DocumentIntelligenceDetailParser,
+    DocumentIntelligencePageParser,
     PDFMinerParser,
     PDFPlumberParser,
     PyMuPDFParser,
@@ -607,8 +608,15 @@ class AmazonTextractPDFLoader(BasePDFLoader):
 class DocumentIntelligenceLoader(BasePDFLoader):
     """Loads a PDF with Azure Document Intelligence"""
 
+    PAGE_MODE = "page"
+    DETAIL_MODE = "detail"
+
     def __init__(
-        self, file_path: str, client: Any, model: str = "prebuilt-document"
+        self,
+        file_path: str,
+        client: Any,
+        model: str = "prebuilt-document",
+        mode: str = PAGE_MODE,
     ) -> None:
         """
         Initialize the object for file processing with Azure Document Intelligence
@@ -627,6 +635,10 @@ class DocumentIntelligenceLoader(BasePDFLoader):
             A DocumentAnalysisClient to perform the analysis of the blob
         model : str
             The model name or ID to be used for form recognition in Azure.
+        mode : str
+            Whether to extract full pages or use a more detailed approach
+            that diferentiates how to handle tables, key-value-pairs and
+            paragraphs (including subheadings)
 
         Examples:
         ---------
@@ -637,7 +649,12 @@ class DocumentIntelligenceLoader(BasePDFLoader):
         ... )
         """
 
-        self.parser = DocumentIntelligenceParser(client=client, model=model)
+        if mode == self.PAGE_MODE:
+            self.parser: BaseBlobParser = DocumentIntelligencePageParser(
+                client=client, model=model
+            )
+        elif mode == self.DETAIL_MODE:
+            self.parser = DocumentIntelligenceDetailParser(client=client, model=model)
         super().__init__(file_path)
 
     def load(self) -> List[Document]:
